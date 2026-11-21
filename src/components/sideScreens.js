@@ -71,6 +71,50 @@ class Beacon:
         return max(gaps) - min(gaps) < self.jitter
 `.split('\n');
 
+const SIGMA_CODE = `# sigma.yml: Purple Team Detection Rules
+title: SSRF Metadata & Stealth SYN Correlation
+id: 94f0c1a8-purple-loop-crt01
+status: active
+level: high
+
+logsource:
+  category: network_connection
+  product: linux
+
+detection:
+  selection_octal:
+    dst_ip|contains:
+      - "169.254.169.254"
+      - "0251.0376.0251.0376"
+      - "0x7f000001"
+  selection_syn_burst:
+    tcp_flags: "SYN"
+    half_open_count|gt: 20
+    timeframe: "5s"
+  condition: selection_octal or selection_syn_burst
+
+falsepositives:
+  - Approved cloud health checks
+
+tags:
+  - attack.initial_access
+  - attack.t1190
+  - attack.discovery
+  - attack.t1046
+  - attack.t1078
+
+# Splunk SPL Pipeline:
+# index=sec sourcetype=zeek:conn
+# | stats count by src_ip, dest_port
+# | where count > 20
+# | eval status="RULE++ ACTIVE"
+
+actions:
+  on_match: quarantine_egress
+  notify: "SIEM CRT-01"
+  score_threshold: -0.75
+`.split('\n');
+
 const KW = new Set('def return if elif else for while in import from as and or not is None True False class try except with lambda pass break continue self'.split(' '));
 const C = {
   text: '#c9d7ee',
@@ -82,8 +126,21 @@ const C = {
   gut: 'rgba(120,150,200,0.45)',
 };
 const TOKEN = /(#.*$)|(f?"[^"]*")|(\b\d+(?:\.\d+)?\b)|([A-Za-z_]\w*)(\s*\()?|(\s+)|(.)/g;
+const YAML_KEY = /^(\s*)([A-Za-z0-9_]+:)(.*)$/;
 
-function tokens(line) {
+function tokens(line, isYaml = false) {
+  if (isYaml) {
+    const trimmed = line.trimStart();
+    if (trimmed.startsWith('#')) return [[line, C.com]];
+    const ym = line.match(YAML_KEY);
+    if (ym) {
+      const out = [];
+      if (ym[1]) out.push([ym[1], C.text]);
+      out.push([ym[2], C.kw]);
+      if (ym[3]) out.push(...tokens(ym[3], false));
+      return out;
+    }
+  }
   const out = [];
   let m;
   TOKEN.lastIndex = 0;
@@ -102,30 +159,30 @@ function tokens(line) {
 
 const FONT_PX = 18;
 const LINE_H = 25;
-const ROWS = CODE.length * 2;
 const FLAT_W = 520;
 const FLAT_H = 1180;
 const GUTTER = 58;
 
 // Kod "kaseti": bir kez çizilir, ekranda döngüyle akar.
-function makeTape() {
+function makeTape(lines = CODE, isYaml = false) {
+  const rows = lines.length * 2;
   const c = document.createElement('canvas');
   c.width = FLAT_W;
-  c.height = ROWS * LINE_H;
+  c.height = rows * LINE_H;
   const g = c.getContext('2d');
   g.fillStyle = '#060c18';
   g.fillRect(0, 0, c.width, c.height);
   g.font = `600 ${FONT_PX}px ui-monospace, Consolas, monospace`;
   g.textBaseline = 'middle';
   const cw = g.measureText('M').width;
-  for (let r = 0; r < ROWS; r++) {
+  for (let r = 0; r < rows; r++) {
     const y = r * LINE_H + LINE_H / 2;
     g.shadowBlur = 0;
     g.fillStyle = C.gut;
-    g.fillText(String((r % CODE.length) + 1).padStart(3, ' '), 6, y);
+    g.fillText(String((r % lines.length) + 1).padStart(3, ' '), 6, y);
     let x = GUTTER;
     g.shadowBlur = 5;
-    for (const [txt, color] of tokens(CODE[r % CODE.length])) {
+    for (const [txt, color] of tokens(lines[r % lines.length], isYaml)) {
       g.fillStyle = color;
       g.shadowColor = color;
       g.fillText(txt, x, y);
@@ -139,7 +196,8 @@ export function tallLife(canvas) {
   const W = (canvas.width = TALL_BOX.width * TALL_RES);
   const H = (canvas.height = TALL_BOX.height * TALL_RES);
   const g = canvas.getContext('2d');
-  const tape = makeTape();
+  const pyTape = makeTape(CODE, false);
+  const sigmaTape = makeTape(SIGMA_CODE, true);
   const flat = document.createElement('canvas');
   flat.width = FLAT_W;
   flat.height = FLAT_H;
@@ -167,21 +225,84 @@ export function tallLife(canvas) {
     cols.push({ x, u0: uOf(t0), u1: uOf(t1), top, h: bot - top });
   }
 
-  const tapeH = tape.height;
+  const TOP_BAR = 38;
+  const rowsVisible = Math.floor((FLAT_H - TOP_BAR - 6) / LINE_H);
   let last = -1;
+  let lastAlert = false;
+  let lastTab = -1;
+  let activeTab = 0;
+  let alertUntil = -1;
+  let curTime = 0;
+
   const draw = (time) => {
+    curTime = time;
+    const tape = activeTab === 0 ? pyTape : sigmaTape;
+    const tapeH = tape.height;
+    const isAlert = time < alertUntil;
     // Satırlar aşağı akar; arada bir kısa hızlanma.
     const off = (time * 38 + Math.max(0, Math.sin(time * 0.7)) * 50) % tapeH;
-    if (Math.abs(off - last) < 0.3) return;
+    if (Math.abs(off - last) < 0.3 && isAlert === lastAlert && activeTab === lastTab) return;
     last = off;
+    lastAlert = isAlert;
+    lastTab = activeTab;
+
     fg.drawImage(tape, 0, off - tapeH);
     fg.drawImage(tape, 0, off);
     if (off + tapeH < FLAT_H) fg.drawImage(tape, 0, off + tapeH);
-    // yanıp sönen imleç
+
+    // Aktif kod satırı vurgu bandı (kodla birlikte perspektife eğilir; alarmda kırmızı-mor parlar)
+    const activeRow = Math.floor(time * 1.15) % rowsVisible;
+    const bandY = TOP_BAR + 6 + activeRow * LINE_H;
+    fg.fillStyle = isAlert ? 'rgba(255,70,120,0.22)' : 'rgba(154,107,255,0.14)';
+    fg.fillRect(0, bandY, FLAT_W, LINE_H);
+    fg.fillStyle = isAlert ? '#ff4d7d' : '#c49bff';
+    fg.fillRect(0, bandY, 3, LINE_H);
+    fg.fillStyle = isAlert ? 'rgba(255,95,140,0.38)' : 'rgba(196,155,255,0.22)';
+    fg.fillRect(0, bandY, FLAT_W, 1);
+    fg.fillRect(0, bandY + LINE_H - 1, FLAT_W, 1);
+
+    // yanıp sönen imleç (sekme çubuğunun hemen altında)
     if (Math.floor(time * 2) % 2 === 0) {
       fg.fillStyle = '#d8e8ff';
-      fg.fillRect(GUTTER, 6, 10, 18);
+      fg.fillRect(GUTTER, 46, 10, 18);
     }
+
+    // Sabit IDE üst sekme çubuğu (kod satırları altından kayar)
+    fg.fillStyle = '#081020';
+    fg.fillRect(0, 0, FLAT_W, TOP_BAR);
+    fg.fillStyle = isAlert ? 'rgba(255,95,140,0.38)' : 'rgba(127,211,255,0.24)';
+    fg.fillRect(0, TOP_BAR - 1, FLAT_W, 1);
+
+    const tabX = activeTab === 0 ? 0 : 214;
+    const tabW = activeTab === 0 ? 214 : 166;
+    fg.fillStyle = isAlert ? 'rgba(255,70,120,0.18)' : 'rgba(154,107,255,0.16)';
+    fg.fillRect(tabX, 0, tabW, TOP_BAR - 1);
+    fg.fillStyle = isAlert ? '#ff4d7d' : '#c49bff';
+    fg.fillRect(tabX, 0, tabW, 2);
+    fg.beginPath();
+    fg.arc(activeTab === 0 ? 16 : 230, TOP_BAR / 2, 3.5, 0, Math.PI * 2);
+    fg.fill();
+
+    fg.font = '600 14px ui-monospace, Consolas, monospace';
+    fg.textBaseline = 'middle';
+    fg.textAlign = 'left';
+    fg.fillStyle = activeTab === 0 ? '#e4eeff' : 'rgba(160,185,220,0.48)';
+    fg.fillText('purple_loop.py', 28, TOP_BAR / 2 + 1);
+
+    fg.fillStyle = activeTab === 1 ? '#e4eeff' : 'rgba(160,185,220,0.48)';
+    fg.fillText('sigma.yml', 244, TOP_BAR / 2 + 1);
+
+    if (isAlert) {
+      fg.fillStyle = '#ff6b93';
+      fg.textAlign = 'right';
+      fg.fillText('▲ RULE++', FLAT_W - 14, TOP_BAR / 2 + 1);
+    } else {
+      const runAlpha = 0.55 + 0.45 * Math.sin(time * 4.5);
+      fg.fillStyle = `rgba(110,255,190,${runAlpha.toFixed(2)})`;
+      fg.textAlign = 'right';
+      fg.fillText('● RUN', FLAT_W - 14, TOP_BAR / 2 + 1);
+    }
+    fg.textAlign = 'left';
 
     g.clearRect(0, 0, W, H);
     for (const c of cols) {
@@ -201,7 +322,7 @@ export function tallLife(canvas) {
   draw(0);
 
   const clock = { t: 0 };
-  return gsap.to(clock, {
+  const tween = gsap.to(clock, {
     t: 1000,
     duration: 1000,
     ease: 'none',
@@ -209,15 +330,24 @@ export function tallLife(canvas) {
     paused: true,
     onUpdate: () => draw(clock.t),
   });
+  tween.triggerAlert = () => {
+    alertUntil = curTime + 1.15;
+  };
+  tween.toggleTab = () => {
+    activeTab = activeTab ? 0 : 1;
+    last = -1;
+    draw(curTime);
+  };
+  return tween;
 }
 
 // ─────────────────────────── Sol alt küçük TV ───────────────────────────
 export const TV_RES = 2;
 
 const CHANNELS = [
-  { name: 'CH 02', label: 'RADAR', draw: radar, len: 5 },
-  { name: 'CH 03', label: 'SIGNAL', draw: scope, len: 4.5 },
-  { name: 'CH 04', label: 'LIVE', draw: globe, len: 5.5 },
+  { key: 'radar', name: 'CH 02', label: 'RADAR', draw: radar, len: 5 },
+  { key: 'signal', name: 'CH 03', label: 'SIGNAL', draw: scope, len: 4.5 },
+  { key: 'live', name: 'CH 04', label: 'LIVE', draw: globe, len: 5.5 },
 ];
 const STATIC = 0.45; // kanal değişirken karınca süresi
 
@@ -405,31 +535,50 @@ function makeNoise(w, h, n) {
   return frames;
 }
 
-export function tvLife(canvas, w, h) {
+export function tvLife(canvas, w, h, onChannel = null, onAlert = null) {
   const W = (canvas.width = w * TV_RES);
   const H = (canvas.height = h * TV_RES);
   const g = canvas.getContext('2d');
   const noise = makeNoise(Math.round(w * 0.9), Math.round(h * 0.9), 5);
   const cycle = CHANNELS.reduce((s, c) => s + c.len + STATIC, 0);
+  let lastKey = null;
+  let lastStrike = -1;
+  let timeOffset = 0;
+  let curClock = 0;
 
   const draw = (time) => {
-    let t = time % cycle;
+    curClock = time;
+    const effTime = time + timeOffset;
+    let t = effTime % cycle;
     let ch = 0;
     while (t > CHANNELS[ch].len + STATIC) {
       t -= CHANNELS[ch].len + STATIC;
       ch++;
     }
     const c = CHANNELS[ch];
+    const key = t < STATIC ? 'static' : c.key;
+    if (onChannel && key !== lastKey) {
+      lastKey = key;
+      onChannel(key);
+    }
+    if (c.key === 'live' && t >= STATIC && onAlert) {
+      const strikeSlot = Math.floor((effTime * 0.7) / 1.4);
+      const strikePhase = (effTime * 0.7 + 0.37) % 1.4;
+      if (strikePhase > 0.92 && strikePhase < 1.08 && lastStrike !== strikeSlot) {
+        lastStrike = strikeSlot;
+        onAlert();
+      }
+    }
     if (t < STATIC) {
       // kanal değişimi: karınca + yuvarlanan görüntü
       g.imageSmoothingEnabled = false;
-      g.drawImage(noise[Math.floor(time * 24) % noise.length], 0, 0, W, H);
+      g.drawImage(noise[Math.floor(effTime * 24) % noise.length], 0, 0, W, H);
       g.imageSmoothingEnabled = true;
     } else {
-      c.draw(g, W, H, time);
+      c.draw(g, W, H, effTime);
       // ara ara yatay kayma
-      if (Math.sin(time * 3.3) > 0.97) {
-        const y = (time * 120) % H;
+      if (Math.sin(effTime * 3.3) > 0.97) {
+        const y = (effTime * 120) % H;
         g.drawImage(canvas, 0, y, W, 10, 8, y, W, 10);
       }
     }
@@ -443,7 +592,7 @@ export function tvLife(canvas, w, h) {
     g.fillText(c.name, W - 14, 12);
     g.textAlign = 'left';
     if (t >= STATIC) {
-      g.fillStyle = Math.floor(time * 2) % 2 ? 'rgba(255,80,120,0.95)' : 'rgba(255,80,120,0.35)';
+      g.fillStyle = Math.floor(effTime * 2) % 2 ? 'rgba(255,80,120,0.95)' : 'rgba(255,80,120,0.35)';
       g.fillText(`● ${c.label}`, 14, H - 12 - H * 0.075);
     }
     g.shadowBlur = 0;
@@ -451,7 +600,7 @@ export function tvLife(canvas, w, h) {
   draw(0);
 
   const clock = { t: 0 };
-  return gsap.to(clock, {
+  const tween = gsap.to(clock, {
     t: 1000,
     duration: 1000,
     ease: 'none',
@@ -459,4 +608,16 @@ export function tvLife(canvas, w, h) {
     paused: true,
     onUpdate: () => draw(clock.t),
   });
+  tween.nextChannel = () => {
+    let t = (curClock + timeOffset) % cycle;
+    let ch = 0;
+    while (t > CHANNELS[ch].len + STATIC) {
+      t -= CHANNELS[ch].len + STATIC;
+      ch++;
+    }
+    const rem = CHANNELS[ch].len + STATIC - t;
+    timeOffset += rem + 0.05;
+    draw(curClock);
+  };
+  return tween;
 }
